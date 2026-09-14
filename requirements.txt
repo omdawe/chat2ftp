@@ -1,0 +1,5 @@
+# SFTP support. FTP and FTPS need nothing beyond the standard library.
+paramiko>=3.4
+
+# Only needed to build the exe:
+# pyinstaller>=6.0
