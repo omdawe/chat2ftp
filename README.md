@@ -35,15 +35,51 @@ Windows-first, but it's plain Python + Tkinter so it runs on macOS and Linux too
    trailing chatter like *"Build reads v12."* is ignored. The box isn't saved — it
    belongs to one build and is stale as soon as the next one arrives.
 4. **Resolve** — each listed path is matched against the files that came out of *this
-   zip*, by path suffix. So `public/css/app.css` finds
+   zip*, by whole path suffix. So `public/css/app.css` finds
    `build/public/css/app.css` whether or not the zip has a wrapper folder — no mapping
    rules to configure. Anything it can't find is flagged `MISSING` rather than silently
    skipped.
-5. **Upload** — each file goes to `remote root` + the listed path, creating remote
-   folders as needed. Leave **remote root** empty to upload straight into the login
-   directory, i.e. `ftp://host/public/css/app.css`.
+5. **Upload** — each file goes to `remote root` + its path, creating remote folders as
+   needed. Leave **remote root** empty to upload straight into the login directory.
 
-The file list shows exactly where every file will land before you press Upload.
+The file list shows exactly where every file will land, and the confirmation dialog
+lists the remote paths, before anything is sent.
+
+### How the remote path is decided
+
+**The remote path always mirrors where the file actually sits locally.** It is never
+taken from the pasted text alone. Two rules enforce that:
+
+- A listed path only matches a file whose local path *ends with the whole listed path*,
+  so the remote path is always a real tail of the local one. There is no
+  match-by-filename fallback — a bare `index.php` will not be matched against some
+  `app/modules/index.php` and then uploaded to your web root.
+- If a listed path is a bare filename but the file lives in a subfolder locally, it is
+  refused with `NEEDS BASE` rather than guessed at.
+
+**Local base** (optional, per project) is the folder inside the zip that corresponds to
+your remote root. Set it and the mapping becomes exact and obvious:
+
+| | |
+|---|---|
+| local base | `build/public` |
+| file in zip | `build/public/css/app.css` |
+| uploads to | `<remote root>/css/app.css` |
+
+Files outside that base are flagged `OUTSIDE BASE` and skipped — handy when a zip
+carries both server files and things that must never reach the server.
+
+### Safety nets
+
+- **Root-level writes are blocked by default.** A file landing directly in the remote
+  root — `index.php` and friends, the files that serve your whole site — is refused with
+  `ROOT BLOCKED` unless the project explicitly ticks *Allow writes to the remote root*.
+  With it ticked you still get a warning listing each file and where it came from,
+  defaulting to "no".
+- **Backup before overwrite** (on by default). Each remote file is downloaded before it
+  is replaced, into `<work folder>\_chat2ftp_backup\<timestamp>\`, mirroring the remote
+  paths. If a build goes wrong, the previous version is sitting on your disk.
+- **Never-upload list** per project, for files holding live keys.
 
 ---
 

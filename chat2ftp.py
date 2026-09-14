@@ -48,7 +48,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 
 APP_NAME = "Chat2FTP"
 APP_TAGLINE = "paste a chat message, upload the files it names"
-APP_VERSION = "1.2"
+APP_VERSION = "1.4"
 INI_NAME = "chat2ftp.ini"
 
 GENERAL = "general"
@@ -70,7 +70,10 @@ FIELDS = {
     "user":           "",
     "password":       "",
     "save_password":  "true",
+    "local_base":     "",
     "remote_root":    "",
+    "backup":         "true",
+    "allow_root":     "false",
     "blocklist":      DEFAULT_BLOCKLIST,
 }
 
@@ -320,30 +323,61 @@ def extract_zip(zip_path, work_dir):
 
 
 def match_file(wanted, files):
-    """Find the extracted file whose path ends with the wanted path.
-       Falls back to a unique filename match. Returns (full_path, status)."""
-    w = wanted.lower()
+    """Find the extracted file whose path ENDS WITH the whole wanted path.
+       Returns (zip_relative_path, full_local_path, status).
+
+       There is deliberately no match-by-filename fallback. Matching a bare
+       "index.php" against some deeply nested index.php, then uploading it to
+       whatever the chat line said, is how you overwrite a live site root."""
+    w = wanted.lower().strip("/")
     cand = [(rel, full) for rel, full in files
             if rel.lower() == w or rel.lower().endswith("/" + w)]
-    if len(cand) == 1:
-        return cand[0][1], "OK"
-    if len(cand) > 1:
-        cand.sort(key=lambda rf: len(rf[0]))
-        return cand[0][1], "OK"
-
-    base = os.path.basename(w)
-    cand = [(rel, full) for rel, full in files if os.path.basename(rel).lower() == base]
-    if len(cand) == 1:
-        return cand[0][1], "OK (name match)"
-    if len(cand) > 1:
-        return None, "AMBIGUOUS"
-    return None, "MISSING"
+    if not cand:
+        return None, None, "MISSING"
+    cand.sort(key=lambda rf: len(rf[0]))
+    return cand[0][0], cand[0][1], "OK"
 
 
-def remote_path_for(remote_root, wanted):
+def zip_wrapper(files):
+    """If every file in the zip sits under one common top folder, that folder is
+       packaging, not structure. Returns it (without slash) or ""."""
+    tops = set()
+    for rel, _full in files:
+        head = rel.split("/", 1)
+        if len(head) == 1:
+            return ""
+        tops.add(head[0])
+        if len(tops) > 1:
+            return ""
+    return tops.pop() if tops else ""
+
+
+def below_wrapper(rel_in_zip, wrapper):
+    if wrapper and rel_in_zip.lower().startswith(wrapper.lower() + "/"):
+        return rel_in_zip[len(wrapper) + 1:]
+    return rel_in_zip
+
+
+def strip_base(rel_in_zip, local_base):
+    """Path of a file relative to the local base folder, i.e. the part of the
+       zip that corresponds to the remote root. Returns None if the file is
+       not under the base at all."""
+    rel = rel_in_zip.replace("\\", "/").strip("/")
+    base = (local_base or "").replace("\\", "/").strip("/")
+    if not base:
+        return None
+    if rel.lower() == base.lower():
+        return None
+    if rel.lower().startswith(base.lower() + "/"):
+        return rel[len(base) + 1:]
+    return None
+
+
+def remote_path_for(remote_root, sub_path):
     """Empty root -> relative path, i.e. straight into the FTP login folder."""
     root = (remote_root or "").strip().replace("\\", "/").rstrip("/")
-    return (root + "/" + wanted) if root else wanted
+    sub = sub_path.replace("\\", "/").strip("/")
+    return (root + "/" + sub) if root else sub
 
 
 # ---------------------------------------------------------------- transfer
@@ -391,6 +425,25 @@ class Transfer:
             self._ftp_cd(remote_dir)
             with open(local_path, "rb") as f:
                 self.ftp.storbinary("STOR " + posixpath.basename(remote_path), f)
+
+    def download(self, remote_path, local_path):
+        """Pull the current remote file down. Returns False if it isn't there."""
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        try:
+            if self.protocol == "SFTP":
+                self.sftp.get(remote_path, local_path)
+            else:
+                self._ftp_cd(posixpath.dirname(remote_path))
+                with open(local_path, "wb") as f:
+                    self.ftp.retrbinary("RETR " + posixpath.basename(remote_path), f.write)
+            return True
+        except Exception:
+            if os.path.isfile(local_path):
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+            return False
 
     def _sftp_makedirs(self, path):
         cur = "/" if path.startswith("/") else "."
@@ -510,18 +563,35 @@ class App(tk.Tk):
         ttk.Checkbutton(box, text="Remember password in ini", variable=self.var["save_password"],
                         onvalue="true", offvalue="false").grid(row=2, column=1, columnspan=3, sticky="w", **pad)
 
-        ttk.Label(box, text="Remote root").grid(row=3, column=0, sticky="w", **pad)
-        self.var["remote_root"] = tk.StringVar()
-        ttk.Entry(box, textvariable=self.var["remote_root"]).grid(row=3, column=1, columnspan=5, sticky="we", **pad)
-        ttk.Label(box, text="empty = upload straight into the login folder",
+        ttk.Label(box, text="Local base").grid(row=3, column=0, sticky="w", **pad)
+        self.var["local_base"] = tk.StringVar()
+        ttk.Entry(box, textvariable=self.var["local_base"]).grid(row=3, column=1, columnspan=5, sticky="we", **pad)
+        ttk.Label(box, text="folder inside the zip that maps to the remote root, e.g. BOS/server  "
+                            "(blank = use the paths from the pasted line)",
                   foreground="#666").grid(row=4, column=1, columnspan=5, sticky="w", padx=6)
 
-        ttk.Label(box, text="Never upload").grid(row=5, column=0, sticky="w", **pad)
+        ttk.Label(box, text="Remote root").grid(row=5, column=0, sticky="w", **pad)
+        self.var["remote_root"] = tk.StringVar()
+        ttk.Entry(box, textvariable=self.var["remote_root"]).grid(row=5, column=1, columnspan=5, sticky="we", **pad)
+        ttk.Label(box, text="empty = upload straight into the login folder",
+                  foreground="#666").grid(row=6, column=1, columnspan=5, sticky="w", padx=6)
+
+        ttk.Label(box, text="Never upload").grid(row=7, column=0, sticky="w", **pad)
         self.var["blocklist"] = tk.StringVar()
-        ttk.Entry(box, textvariable=self.var["blocklist"]).grid(row=5, column=1, columnspan=5, sticky="we", **pad)
+        ttk.Entry(box, textvariable=self.var["blocklist"]).grid(row=7, column=1, columnspan=5, sticky="we", **pad)
+
+        self.var["backup"] = tk.StringVar()
+        ttk.Checkbutton(box, text="Download each remote file before overwriting it (backup)",
+                        variable=self.var["backup"], onvalue="true", offvalue="false").grid(
+                        row=8, column=1, columnspan=5, sticky="w", **pad)
+
+        self.var["allow_root"] = tk.StringVar()
+        ttk.Checkbutton(box, text="Allow writes to the remote root itself (index.php and the like)",
+                        variable=self.var["allow_root"], onvalue="true", offvalue="false").grid(
+                        row=9, column=1, columnspan=5, sticky="w", **pad)
 
         bar = ttk.Frame(box)
-        bar.grid(row=6, column=0, columnspan=6, sticky="w", **pad)
+        bar.grid(row=10, column=0, columnspan=6, sticky="w", **pad)
         ttk.Button(bar, text="Test Connection", command=self.on_test).pack(side="left")
         ttk.Button(bar, text="Open Settings Folder", command=self.on_open_ini).pack(side="left", padx=(6, 0))
 
@@ -846,15 +916,44 @@ class App(tk.Tk):
             return
 
         root = self.var["remote_root"].get()
+        base = self.var["local_base"].get()
+        wrapper = zip_wrapper(self.files)
         blocked = self.blocked_set()
         self.rows = []
         for w in wanted:
-            remote = remote_path_for(root, w)
-            if w.lower() in blocked:
-                self.rows.append({"wanted": w, "remote": remote, "local": None, "status": "BLOCKED"})
-                continue
-            local, status = match_file(w, self.files)
-            self.rows.append({"wanted": w, "remote": remote, "local": local, "status": status})
+            rel, local, status = match_file(w, self.files)
+            row = {"wanted": w, "rel": rel, "local": local, "remote": "", "status": status}
+
+            if status == "OK":
+                # The remote path is derived from where the file actually sits
+                # locally - never from the pasted text alone. With a base set,
+                # it is the path below that base; otherwise it is the tail of
+                # the local path that the listed path matched, which by
+                # construction is a real part of the local structure.
+                if base.strip():
+                    sub = strip_base(rel, base)
+                    if sub is None:
+                        row["status"] = "OUTSIDE BASE"
+                    else:
+                        row["remote"] = remote_path_for(root, sub)
+                elif "/" not in w.strip("/") and "/" in below_wrapper(rel, wrapper):
+                    # A bare filename that lives in a subfolder locally. Sending
+                    # it to the remote root is how a live site gets wrecked, and
+                    # nothing here says where it really belongs - so refuse.
+                    # A file at the top of the zip is fine: it really is root level.
+                    row["status"] = "NEEDS BASE"
+                else:
+                    row["remote"] = remote_path_for(root, w)
+
+            if row["status"] == "OK" and "/" not in row["remote"].strip("/"):
+                # Lands directly in the remote root - the file that serves the
+                # whole site. Off unless the project explicitly allows it.
+                if not as_bool(self.var["allow_root"].get()):
+                    row["status"] = "ROOT BLOCKED"
+
+            if row["status"] == "OK" and w.lower() in blocked:
+                row["status"] = "BLOCKED"
+            self.rows.append(row)
 
         work = self.var["work_dir"].get().strip()
         self.tree.delete(*self.tree.get_children())
@@ -867,18 +966,42 @@ class App(tk.Tk):
                     shown = r["local"]
             self.tree.insert("", "end", values=(r["status"], r["remote"], shown))
 
-        ok = sum(1 for r in self.rows if r["status"].startswith("OK"))
+        ok = sum(1 for r in self.rows if r["status"] == "OK")
         self.log("Resolved %d of %d listed files. Target %s"
                  % (ok, len(self.rows), self.target_label()))
         for r in self.rows:
-            if not r["status"].startswith("OK"):
+            if r["status"] != "OK":
                 self.log("  %s  %s" % (r["status"], r["wanted"]))
+                if r["status"] == "ROOT BLOCKED":
+                    self.log("     would overwrite %s in the remote root. If that is really "
+                             "intended, tick 'Allow writes to the remote root'."
+                             % r["remote"])
+                if r["status"] == "NEEDS BASE":
+                    self.log("     '%s' sits at %s locally. Set Local base (e.g. the folder "
+                             "that maps to your web root) or list the full path."
+                             % (r["wanted"], r["rel"]))
         self.save_now()
+
+    def root_level_warning(self, todo):
+        """Files landing directly in the remote root, with nothing above them.
+           This is what destroys a live site when a chat line names a bare
+           filename, so it is never done without saying so out loud."""
+        root = self.var["remote_root"].get().strip().strip("/")
+        bare = [r for r in todo if "/" not in r["remote"].strip("/")]
+        if not bare:
+            return True
+        where = ("/" + root) if root else "the login folder (your web root)"
+        names = "\n".join("    %s   <-  %s" % (r["remote"], r["rel"]) for r in bare)
+        return messagebox.askyesno(
+            APP_NAME,
+            "%d file(s) will be written straight into %s, overwriting whatever "
+            "is there:\n\n%s\n\nIs that what you want?" % (len(bare), where, names),
+            icon="warning", default="no")
 
     def on_upload(self):
         if self.busy:
             return
-        todo = [r for r in self.rows if r["status"].startswith("OK")]
+        todo = [r for r in self.rows if r["status"] == "OK"]
         if not todo:
             messagebox.showinfo(APP_NAME, "Nothing resolved to upload. Press Resolve first.")
             return
@@ -886,8 +1009,16 @@ class App(tk.Tk):
         if not s["host"] or not s["user"]:
             messagebox.showerror(APP_NAME, "Host and user are required.")
             return
-        if not messagebox.askyesno(APP_NAME, "Project '%s'\n\nUpload %d file(s) to\n%s ?"
-                                   % (self.project, len(todo), self.target_label())):
+
+        preview = "\n".join("    " + r["remote"] for r in todo[:12])
+        if len(todo) > 12:
+            preview += "\n    ... and %d more" % (len(todo) - 12)
+        if not messagebox.askyesno(
+                APP_NAME,
+                "Project '%s'\n\nUpload %d file(s) to %s\n\n%s"
+                % (self.project, len(todo), self.target_label(), preview)):
+            return
+        if not self.root_level_warning(todo):
             return
         self.save_now()
         self.busy = True
@@ -895,21 +1026,36 @@ class App(tk.Tk):
         threading.Thread(target=self._upload_worker, args=(todo, s), daemon=True).start()
 
     def _upload_worker(self, todo, s):
+        import datetime
         conn = None
-        sent = failed = 0
+        sent = failed = saved = 0
+        do_backup = as_bool(s.get("backup", "true"))
+        backup_dir = os.path.join(s["work_dir"].strip() or os.path.expanduser("~"),
+                                  "_chat2ftp_backup",
+                                  datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
         try:
             self.log("Connecting %s to %s:%s ..." % (s["protocol"], s["host"], s["port"]))
             conn = Transfer(s["protocol"], s["host"], s["port"], s["user"], s["password"], self.log)
             self.log("Connected. Login folder: %s" % conn.home)
+            if do_backup:
+                self.log("Backups of replaced files go to %s" % backup_dir)
             for r in todo:
                 try:
+                    if do_backup:
+                        dest = os.path.join(backup_dir, *r["remote"].strip("/").split("/"))
+                        if conn.download(r["remote"], dest):
+                            saved += 1
+                            self.log("     backed up existing %s" % r["remote"])
                     conn.upload(r["local"], r["remote"])
                     sent += 1
                     self.log("OK   %s" % r["remote"])
                 except Exception as e:
                     failed += 1
                     self.log("FAIL %s  (%s)" % (r["remote"], e))
-            self.log("Done. %d uploaded, %d failed." % (sent, failed))
+            self.log("Done. %d uploaded, %d failed, %d previous version(s) backed up."
+                     % (sent, failed, saved))
+            if saved:
+                self.log("Backups: %s" % backup_dir)
         except Exception as e:
             self.log("ERROR: %s" % e)
             self.log(traceback.format_exc().strip())
