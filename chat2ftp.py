@@ -35,6 +35,7 @@ MIT licensed. https://github.com/YOURNAME/chat2ftp
 import os
 import re
 import sys
+import time
 import fnmatch
 import zipfile
 import ftplib
@@ -48,7 +49,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 
 APP_NAME = "Chat2FTP"
 APP_TAGLINE = "paste a chat message, upload the files it names"
-APP_VERSION = "1.4"
+APP_VERSION = "1.7"
 INI_NAME = "chat2ftp.ini"
 
 GENERAL = "general"
@@ -358,6 +359,77 @@ def below_wrapper(rel_in_zip, wrapper):
     return rel_in_zip
 
 
+def suggest_base(files):
+    """Work out the folder inside the zip that corresponds to the remote root.
+
+       Descends through packaging folders - ones that contain a single
+       subfolder and no files of their own - and stops where the real
+       structure starts. For a zip holding build/site/{public,admin,
+       migrations}/... that yields "build/site"."""
+    rels = [rel for rel, _full in files]
+    if not rels:
+        return ""
+    parts = []
+    while True:
+        prefix = "/".join(parts)
+        here = [r[len(prefix) + 1:] if prefix else r
+                for r in rels
+                if not prefix or r.lower().startswith(prefix.lower() + "/")]
+        loose = [h for h in here if "/" not in h]
+        subdirs = {h.split("/", 1)[0] for h in here if "/" in h}
+        if loose or len(subdirs) != 1:
+            return prefix
+        parts.append(subdirs.pop())
+
+
+def under_base(rel_in_zip, local_base):
+    """Path of a file below the base folder, or None if it is not under it."""
+    rel = rel_in_zip.replace("\\", "/").strip("/")
+    base = (local_base or "").replace("\\", "/").strip("/")
+    if not base:
+        return rel
+    if rel.lower().startswith(base.lower() + "/"):
+        return rel[len(base) + 1:]
+    return None
+
+
+def glob_to_re(pattern):
+    """Glob where * stops at a folder boundary, the way a shell behaves:
+       public/*.php matches public/faq.php but NOT
+       public/inc/money.php or admin/public/money.php.
+       ** crosses folders when you want that."""
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            if pattern[i:i + 2] == "**":
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("^" + "".join(out) + "$", re.I)
+
+
+def select_files(token, pairs):
+    """Which files a listed token refers to. pairs is [(sub_path, full_local)],
+       every sub_path already relative to the local base.
+
+       A glob is anchored at the base, so it selects exactly the folder level
+       you wrote. A plain name matches a whole path tail, and if that hits more
+       than one file the caller refuses rather than guessing."""
+    t = token.replace("\\", "/").strip("/")
+    if "*" in t or "?" in t:
+        rx = glob_to_re(t)
+        return [p for p in pairs if rx.match(p[0])]
+    tl = t.lower()
+    return [p for p in pairs if p[0].lower() == tl or p[0].lower().endswith("/" + tl)]
+
+
 def strip_base(rel_in_zip, local_base):
     """Path of a file relative to the local base folder, i.e. the part of the
        zip that corresponds to the remote root. Returns None if the file is
@@ -478,12 +550,45 @@ class Transfer:
 
 # ---------------------------------------------------------------- gui
 
+class Collapsible(ttk.Frame):
+    """A titled section that folds away. Settings you set once and rarely look
+       at live in these, out of the way of the panels you actually work in."""
+
+    def __init__(self, master, title, opened=False, on_toggle=None):
+        super().__init__(master)
+        self.title_text = title
+        self.opened = bool(opened)
+        self.on_toggle = on_toggle
+        self.header = ttk.Button(self, text="", command=self.toggle, style="Section.TButton")
+        self.header.pack(fill="x")
+        self.body = ttk.Frame(self)
+        self._sync()
+
+    def toggle(self):
+        self.opened = not self.opened
+        self._sync()
+        if self.opened and self.on_toggle:
+            self.on_toggle(self)
+
+    def open(self):
+        if not self.opened:
+            self.toggle()
+
+    def _sync(self):
+        if self.opened:
+            self.body.pack(fill="x", padx=10, pady=(4, 8))
+            self.header.configure(text="\u25bc  %s" % self.title_text)
+        else:
+            self.body.forget()
+            self.header.configure(text="\u25b6  %s" % self.title_text)
+
+
 class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
         self.geometry("1000x860")
-        self.minsize(880, 700)
+        self.minsize(820, 420)
 
         self.store = Store(INI_FILE)
         self.project = self.store.current()
@@ -495,6 +600,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self.apply_values(self.store.get(self.project))
+        self.show_base()
         self.refresh_projects()
         self._arm_autosave()
         self._loading = False
@@ -506,12 +612,89 @@ class App(tk.Tk):
 
     # -------------------------------------------------------- ui build
 
+    def _build_scroll_host(self):
+        """Everything lives on a scrolling page, so a short window still
+           reaches the sections at the bottom without being resized."""
+        self.status = ttk.Label(self, text="", anchor="w", foreground="#444")
+        self.status.pack(side="bottom", fill="x", padx=10, pady=(2, 6))
+
+        host = ttk.Frame(self)
+        host.pack(side="top", fill="both", expand=True)
+        self.canvas = tk.Canvas(host, highlightthickness=0, borderwidth=0,
+                                takefocus=0)
+        self.vsb = ttk.Scrollbar(host, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self._on_scroll_set)
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.page = ttk.Frame(self.canvas)
+        self._page_id = self.canvas.create_window((0, 0), window=self.page, anchor="nw")
+        self.page.bind("<Configure>", self._page_resized)
+        self.canvas.bind("<Configure>", self._canvas_resized)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(seq, self._on_wheel)
+
+    def _on_scroll_set(self, first, last):
+        # hide the scrollbar when everything already fits
+        try:
+            if float(first) <= 0.0 and float(last) >= 1.0:
+                self.vsb.pack_forget()
+            elif not self.vsb.winfo_ismapped():
+                self.vsb.pack(side="right", fill="y", before=self.canvas)
+        except Exception:
+            pass
+        self.vsb.set(first, last)
+
+    def _page_resized(self, _e=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _canvas_resized(self, e):
+        self.canvas.itemconfigure(self._page_id, width=e.width)
+
+    def _on_wheel(self, event):
+        # widgets with their own scrollbar keep the wheel for themselves
+        w = getattr(event, "widget", None)
+        for _ in range(12):
+            if w is None:
+                break
+            if w in (getattr(self, "logbox", None), getattr(self, "tree", None),
+                     getattr(self, "text", None)):
+                return
+            w = getattr(w, "master", None)
+        num = getattr(event, "num", 0)
+        delta = getattr(event, "delta", 0)
+        step = -1 if (num == 4 or delta > 0) else 1
+        try:
+            self.canvas.yview_scroll(step, "units")
+        except Exception:
+            pass
+
+    def scroll_into_view(self, widget):
+        """Bring a widget into view after a section opens."""
+        def _do():
+            try:
+                self._page_resized()
+                top = widget.winfo_y()
+                page_h = max(self.page.winfo_height(), 1)
+                view_h = self.canvas.winfo_height()
+                if top + widget.winfo_height() > self.canvas.canvasy(0) + view_h:
+                    self.canvas.yview_moveto(max(0.0, min(1.0, top / float(page_h))))
+            except Exception:
+                pass
+        self.after(50, _do)
+
     def _build_ui(self):
         pad = {"padx": 6, "pady": 3}
         self.var = {}
+        self._build_scroll_host()
+        style = ttk.Style(self)
+        try:
+            style.configure("Section.TButton", anchor="w", padding=(8, 5))
+        except Exception:
+            pass
 
         # --- project
-        box = ttk.LabelFrame(self, text="Project")
+        box = ttk.LabelFrame(self.page, text="Project")
         box.pack(fill="x", padx=8, pady=(8, 4))
         bar = ttk.Frame(box)
         bar.pack(fill="x", padx=6, pady=6)
@@ -525,16 +708,73 @@ class App(tk.Tk):
         ttk.Button(bar, text="Rename", command=self.on_project_rename).pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="Delete", command=self.on_project_delete).pack(side="left", padx=(4, 0))
 
-        # --- folders
-        box = ttk.LabelFrame(self, text="Folders")
-        box.pack(fill="x", padx=8, pady=4)
+        # --- build
+        box = ttk.LabelFrame(self.page, text="Build")
+        box.pack(fill="both", expand=False, padx=8, pady=4)
+
+        bar = ttk.Frame(box)
+        bar.pack(fill="x", padx=6, pady=4)
+        ttk.Label(bar, text="File pattern").pack(side="left")
+        self.var["pattern"] = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.var["pattern"], width=30).pack(side="left", padx=(6, 12))
+        ttk.Button(bar, text="Load Build", command=self.on_load_build).pack(side="left")
+        ttk.Button(bar, text="Pick Zip...", command=self.on_pick_zip).pack(side="left", padx=(6, 0))
+        self.zip_label = ttk.Label(bar, text="no build loaded")
+        self.zip_label.pack(side="left", padx=12)
+        # the base decides every upload path, so it stays visible even while
+        # the Server section is folded away
+        self.base_label = ttk.Label(bar, text="", foreground="#666")
+        self.base_label.pack(side="right", padx=8)
+
+        ttk.Label(box, text="Paste the Upload line from chat:").pack(anchor="w", padx=6)
+        self.text = tk.Text(box, height=5, wrap="word")
+        self.text.pack(fill="x", padx=6, pady=(0, 6))
+
+        bar = ttk.Frame(box)
+        bar.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(bar, text="Resolve", command=self.on_resolve).pack(side="left")
+        self.btn_upload = ttk.Button(bar, text="Upload", command=self.on_upload)
+        self.btn_upload.pack(side="left", padx=(6, 0))
+
+        # --- file list
+        box = ttk.LabelFrame(self.page, text="Files")
+        box.pack(fill="both", expand=True, padx=8, pady=4)
+        cols = ("status", "remote", "local")
+        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=8)
+        self.tree.heading("status", text="Status")
+        self.tree.heading("remote", text="Uploads to")
+        self.tree.heading("local", text="From (inside work folder)")
+        self.tree.column("status", width=110, anchor="w")
+        self.tree.column("remote", width=330, anchor="w")
+        self.tree.column("local", width=450, anchor="w")
+        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
+        self.tree.configure(yscrollcommand=sb.set)
+
+        # --- log
+        box = ttk.LabelFrame(self.page, text="Log")
+        box.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+        self.logbox = tk.Text(box, height=8, wrap="word", state="disabled")
+        self.logbox.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.logbox.yview)
+        sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
+        self.logbox.configure(yscrollcommand=sb.set)
+
+        # --- folders (collapsed section, below the panels that matter)
+        self.sec_folders = Collapsible(self.page, "Folders", opened=False,
+                                       on_toggle=self.scroll_into_view)
+        self.sec_folders.pack(fill="x", padx=8, pady=(2, 0))
+        box = self.sec_folders.body
         self._folder_row(box, 0, "Zip folder (downloads)", "zip_dir")
         self._folder_row(box, 1, "Work folder (unzip target)", "work_dir")
         box.columnconfigure(1, weight=1)
 
-        # --- server
-        box = ttk.LabelFrame(self, text="Server")
-        box.pack(fill="x", padx=8, pady=4)
+        # --- server (collapsed section)
+        self.sec_server = Collapsible(self.page, "Server", opened=False,
+                                      on_toggle=self.scroll_into_view)
+        self.sec_server.pack(fill="x", padx=8, pady=(2, 0))
+        box = self.sec_server.body
 
         ttk.Label(box, text="Protocol").grid(row=0, column=0, sticky="w", **pad)
         self.var["protocol"] = tk.StringVar()
@@ -566,7 +806,7 @@ class App(tk.Tk):
         ttk.Label(box, text="Local base").grid(row=3, column=0, sticky="w", **pad)
         self.var["local_base"] = tk.StringVar()
         ttk.Entry(box, textvariable=self.var["local_base"]).grid(row=3, column=1, columnspan=5, sticky="we", **pad)
-        ttk.Label(box, text="folder inside the zip that maps to the remote root, e.g. BOS/server  "
+        ttk.Label(box, text="folder inside the zip that maps to the remote root - auto-detected on load  "
                             "(blank = use the paths from the pasted line)",
                   foreground="#666").grid(row=4, column=1, columnspan=5, sticky="w", padx=6)
 
@@ -597,58 +837,7 @@ class App(tk.Tk):
 
         box.columnconfigure(3, weight=1)
 
-        # --- build
-        box = ttk.LabelFrame(self, text="Build")
-        box.pack(fill="both", expand=False, padx=8, pady=4)
 
-        bar = ttk.Frame(box)
-        bar.pack(fill="x", padx=6, pady=4)
-        ttk.Label(bar, text="File pattern").pack(side="left")
-        self.var["pattern"] = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.var["pattern"], width=30).pack(side="left", padx=(6, 12))
-        ttk.Button(bar, text="Load Build", command=self.on_load_build).pack(side="left")
-        ttk.Button(bar, text="Pick Zip...", command=self.on_pick_zip).pack(side="left", padx=(6, 0))
-        self.zip_label = ttk.Label(bar, text="no build loaded")
-        self.zip_label.pack(side="left", padx=12)
-
-        ttk.Label(box, text="Paste the Upload line from chat:").pack(anchor="w", padx=6)
-        self.text = tk.Text(box, height=5, wrap="word")
-        self.text.pack(fill="x", padx=6, pady=(0, 6))
-
-        bar = ttk.Frame(box)
-        bar.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Button(bar, text="Resolve", command=self.on_resolve).pack(side="left")
-        self.btn_upload = ttk.Button(bar, text="Upload", command=self.on_upload)
-        self.btn_upload.pack(side="left", padx=(6, 0))
-
-        # --- file list
-        box = ttk.LabelFrame(self, text="Files")
-        box.pack(fill="both", expand=True, padx=8, pady=4)
-        cols = ("status", "remote", "local")
-        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=8)
-        self.tree.heading("status", text="Status")
-        self.tree.heading("remote", text="Uploads to")
-        self.tree.heading("local", text="From (inside work folder)")
-        self.tree.column("status", width=110, anchor="w")
-        self.tree.column("remote", width=330, anchor="w")
-        self.tree.column("local", width=450, anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
-        sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
-        self.tree.configure(yscrollcommand=sb.set)
-
-        # --- log
-        box = ttk.LabelFrame(self, text="Log")
-        box.pack(fill="both", expand=True, padx=8, pady=(4, 0))
-        self.logbox = tk.Text(box, height=8, wrap="word", state="disabled")
-        self.logbox.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        sb = ttk.Scrollbar(box, orient="vertical", command=self.logbox.yview)
-        sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
-        self.logbox.configure(yscrollcommand=sb.set)
-
-        # --- status bar
-        self.status = ttk.Label(self, text="", anchor="w", foreground="#444")
-        self.status.pack(fill="x", padx=10, pady=(2, 6))
         self.set_status("settings: %s" % INI_FILE)
 
     def _folder_row(self, parent, row, label, key):
@@ -720,9 +909,13 @@ class App(tk.Tk):
         else:
             self.set_status("CANNOT SAVE SETTINGS: %s" % err)
             if not quiet:
-                messagebox.showerror(APP_NAME, "Could not write settings:\n%s\n\n%s"
+                self.say_error("Could not write settings:\n%s\n\n%s"
                                      % (INI_FILE, err))
         return ok
+
+    def show_base(self):
+        base = self.var["local_base"].get().strip()
+        self.base_label.configure(text=("base: %s" % base) if base else "")
 
     def set_status(self, msg):
         try:
@@ -740,13 +933,14 @@ class App(tk.Tk):
         if not name:
             return None
         if ":" in name or "[" in name or "]" in name:
-            messagebox.showerror(APP_NAME, "Project names cannot contain : [ ]")
+            self.say_error("Project names cannot contain : [ ]")
             return None
         return name
 
     def _switch_to(self, name):
         self.project = name
         self.apply_values(self.store.get(name))
+        self.show_base()
         self.refresh_projects()
         self.store.set_current(name)
         self.store.save()
@@ -769,7 +963,7 @@ class App(tk.Tk):
         if not name:
             return
         if name in self.store.projects():
-            messagebox.showerror(APP_NAME, "That project already exists.")
+            self.say_error("That project already exists.")
             return
         self.save_now()
         self.store.create(name)
@@ -780,7 +974,7 @@ class App(tk.Tk):
         if not name:
             return
         if name in self.store.projects():
-            messagebox.showerror(APP_NAME, "That project already exists.")
+            self.say_error("That project already exists.")
             return
         self.save_now()
         self.store.create(name, copy_from=self.project)
@@ -791,7 +985,7 @@ class App(tk.Tk):
         if not name or name == self.project:
             return
         if name in self.store.projects():
-            messagebox.showerror(APP_NAME, "That project already exists.")
+            self.say_error("That project already exists.")
             return
         self.save_now()
         self.store.rename(self.project, name)
@@ -799,9 +993,9 @@ class App(tk.Tk):
 
     def on_project_delete(self):
         if len(self.store.projects()) < 2:
-            messagebox.showinfo(APP_NAME, "This is the only project.")
+            self.say_info("This is the only project.")
             return
-        if not messagebox.askyesno(APP_NAME, "Delete project '%s'?" % self.project):
+        if not self.ask_yes_no("Delete project '%s'?" % self.project):
             return
         gone = self.project
         self.store.delete(gone)
@@ -812,12 +1006,26 @@ class App(tk.Tk):
     # -------------------------------------------------------- helpers
 
     def log(self, msg):
+        stamp = time.strftime("%H:%M:%S")
         def _do():
             self.logbox.configure(state="normal")
-            self.logbox.insert("end", msg + "\n")
+            for i, line in enumerate((msg or "").split("\n")):
+                # continuation lines line up under the first, not restamped
+                self.logbox.insert("end", ("%s  " % stamp if i == 0 else " " * 10) + line + "\n")
             self.logbox.see("end")
             self.logbox.configure(state="disabled")
         self.after(0, _do)
+
+    # Every dialog is given this window as its parent, so it opens centred over
+    # the app instead of the middle of the screen.
+    def say_error(self, msg):
+        messagebox.showerror(APP_NAME, msg, parent=self)
+
+    def say_info(self, msg):
+        messagebox.showinfo(APP_NAME, msg, parent=self)
+
+    def ask_yes_no(self, msg, **kw):
+        return messagebox.askyesno(APP_NAME, msg, parent=self, **kw)
 
     def blocked_set(self):
         raw = self.var["blocklist"].get()
@@ -842,14 +1050,15 @@ class App(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", folder])
         except Exception as e:
-            messagebox.showinfo(APP_NAME, "Settings file:\n%s\n\n(%s)" % (INI_FILE, e))
+            self.say_info("Settings file:\n%s\n\n(%s)" % (INI_FILE, e))
 
     def on_test(self):
         if self.busy:
             return
         s = self.collect()
         if not s["host"] or not s["user"]:
-            messagebox.showerror(APP_NAME, "Host and user are required.")
+            self.sec_server.open()
+            self.say_error("Host and user are required.")
             return
         self.save_now(quiet=False)
         self.busy = True
@@ -873,12 +1082,13 @@ class App(tk.Tk):
         self.save_now(quiet=False)
         folder = self.var["zip_dir"].get()
         if not os.path.isdir(folder):
-            messagebox.showerror(APP_NAME, "Zip folder not found:\n%s" % folder)
+            self.sec_folders.open()
+            self.say_error("Zip folder not found:\n%s" % folder)
             return
         pattern = self.var["pattern"].get()
         z = find_build(folder, pattern)
         if not z:
-            messagebox.showerror(APP_NAME, "Nothing matching '%s' in:\n%s" % (pattern, folder))
+            self.say_error("Nothing matching '%s' in:\n%s" % (pattern, folder))
             return
         self._load_zip(z)
 
@@ -892,14 +1102,21 @@ class App(tk.Tk):
     def _load_zip(self, zip_path):
         work = self.var["work_dir"].get().strip()
         if not work:
-            messagebox.showerror(APP_NAME, "Set a work folder first.")
+            self.sec_folders.open()
+            self.say_error("Set a work folder first.")
             return
         try:
             self.files = extract_zip(zip_path, work)
         except Exception as e:
-            messagebox.showerror(APP_NAME, "Could not extract:\n%s" % e)
+            self.say_error("Could not extract:\n%s" % e)
             return
         self.zip_label.configure(text=os.path.basename(zip_path))
+        if not self.var["local_base"].get().strip():
+            guess = suggest_base(self.files)
+            self.var["local_base"].set(guess)
+            self.log("Local base auto-detected as '%s' - every upload path is "
+                     "relative to this." % guess)
+        self.show_base()
         self.log("Unzipped %s  ->  %s  (%d files)"
                  % (os.path.basename(zip_path), work, len(self.files)))
         self.save_now()
@@ -908,78 +1125,94 @@ class App(tk.Tk):
 
     def on_resolve(self):
         if not self.files:
-            messagebox.showinfo(APP_NAME, "Load a build first.")
+            self.say_info("Load a build first.")
             return
-        wanted = parse_paths(self.text.get("1.0", "end"))
-        if not wanted:
-            messagebox.showinfo(APP_NAME, "No file paths found in the pasted text.")
+        tokens = parse_paths(self.text.get("1.0", "end"))
+        if not tokens:
+            self.say_info("No file paths found in the pasted text.")
+            return
+
+        base = self.var["local_base"].get().strip()
+        if not base:
+            base = suggest_base(self.files)
+            self.var["local_base"].set(base)
+            self.log("Local base auto-detected as '%s'." % base)
+        self.show_base()
+
+        # Everything below the base, keyed by its path relative to the base.
+        # THAT path is the upload destination - not anything from the pasted text.
+        pairs = []
+        for rel, full in self.files:
+            sub = under_base(rel, base)
+            if sub:
+                pairs.append((sub, full))
+        if not pairs:
+            self.sec_server.open()
+            self.say_error("Nothing in this zip sits under the local base '%s'.\n\n"
+                           "Check the Local base field." % base)
             return
 
         root = self.var["remote_root"].get()
-        base = self.var["local_base"].get()
-        wrapper = zip_wrapper(self.files)
         blocked = self.blocked_set()
+        allow_root = as_bool(self.var["allow_root"].get())
+
         self.rows = []
-        for w in wanted:
-            rel, local, status = match_file(w, self.files)
-            row = {"wanted": w, "rel": rel, "local": local, "remote": "", "status": status}
+        for token in tokens:
+            hits = select_files(token, pairs)
 
-            if status == "OK":
-                # The remote path is derived from where the file actually sits
-                # locally - never from the pasted text alone. With a base set,
-                # it is the path below that base; otherwise it is the tail of
-                # the local path that the listed path matched, which by
-                # construction is a real part of the local structure.
-                if base.strip():
-                    sub = strip_base(rel, base)
-                    if sub is None:
-                        row["status"] = "OUTSIDE BASE"
-                    else:
-                        row["remote"] = remote_path_for(root, sub)
-                elif "/" not in w.strip("/") and "/" in below_wrapper(rel, wrapper):
-                    # A bare filename that lives in a subfolder locally. Sending
-                    # it to the remote root is how a live site gets wrecked, and
-                    # nothing here says where it really belongs - so refuse.
-                    # A file at the top of the zip is fine: it really is root level.
-                    row["status"] = "NEEDS BASE"
-                else:
-                    row["remote"] = remote_path_for(root, w)
+            if not hits:
+                self.rows.append({"token": token, "sub": "", "local": None,
+                                  "remote": "", "status": "MISSING"})
+                continue
 
-            if row["status"] == "OK" and "/" not in row["remote"].strip("/"):
-                # Lands directly in the remote root - the file that serves the
-                # whole site. Off unless the project explicitly allows it.
-                if not as_bool(self.var["allow_root"].get()):
-                    row["status"] = "ROOT BLOCKED"
+            if len(hits) > 1 and not ("*" in token or "?" in token):
+                self.rows.append({"token": token, "sub": "", "local": None,
+                                  "remote": "", "status": "AMBIGUOUS",
+                                  "options": [h[0] for h in hits]})
+                continue
 
-            if row["status"] == "OK" and w.lower() in blocked:
-                row["status"] = "BLOCKED"
-            self.rows.append(row)
+            for sub, full in hits:
+                remote = remote_path_for(root, sub)
+                status = "OK"
+                if "/" not in remote.strip("/") and not allow_root:
+                    status = "ROOT BLOCKED"
+                elif sub.lower() in blocked or token.lower() in blocked:
+                    status = "BLOCKED"
+                self.rows.append({"token": token, "sub": sub, "local": full,
+                                  "remote": remote, "status": status})
 
-        work = self.var["work_dir"].get().strip()
+        # a file listed twice (e.g. by name and by glob) is uploaded once
+        seen, unique = set(), []
+        for r in self.rows:
+            key = (r["status"], r["remote"], r["sub"])
+            if r["status"] == "OK" and r["remote"] in seen:
+                continue
+            if r["status"] == "OK":
+                seen.add(r["remote"])
+            unique.append(r)
+        self.rows = unique
+
         self.tree.delete(*self.tree.get_children())
         for r in self.rows:
-            shown = ""
-            if r["local"]:
-                try:
-                    shown = os.path.relpath(r["local"], work).replace("\\", "/")
-                except Exception:
-                    shown = r["local"]
-            self.tree.insert("", "end", values=(r["status"], r["remote"], shown))
+            self.tree.insert("", "end", values=(r["status"], r["remote"],
+                                                (base + "/" + r["sub"]) if r["sub"] else r["token"]))
 
         ok = sum(1 for r in self.rows if r["status"] == "OK")
-        self.log("Resolved %d of %d listed files. Target %s"
-                 % (ok, len(self.rows), self.target_label()))
+        self.log("Base '%s'. Resolved %d file(s) from %d listed item(s). Target %s"
+                 % (base, ok, len(tokens), self.target_label()))
         for r in self.rows:
-            if r["status"] != "OK":
-                self.log("  %s  %s" % (r["status"], r["wanted"]))
-                if r["status"] == "ROOT BLOCKED":
-                    self.log("     would overwrite %s in the remote root. If that is really "
-                             "intended, tick 'Allow writes to the remote root'."
-                             % r["remote"])
-                if r["status"] == "NEEDS BASE":
-                    self.log("     '%s' sits at %s locally. Set Local base (e.g. the folder "
-                             "that maps to your web root) or list the full path."
-                             % (r["wanted"], r["rel"]))
+            if r["status"] == "OK":
+                continue
+            self.log("  %s  %s" % (r["status"], r["token"]))
+            if r["status"] == "AMBIGUOUS":
+                for o in r.get("options", []):
+                    self.log("     could be %s" % o)
+                self.log("     list the full path to say which one you mean")
+            elif r["status"] == "ROOT BLOCKED":
+                self.log("     %s sits at the remote root. Tick 'Allow writes to the "
+                         "remote root' only if you really mean it." % r["remote"])
+            elif r["status"] == "MISSING":
+                self.log("     nothing under '%s' matches that" % base)
         self.save_now()
 
     def root_level_warning(self, todo):
@@ -991,10 +1224,8 @@ class App(tk.Tk):
         if not bare:
             return True
         where = ("/" + root) if root else "the login folder (your web root)"
-        names = "\n".join("    %s   <-  %s" % (r["remote"], r["rel"]) for r in bare)
-        return messagebox.askyesno(
-            APP_NAME,
-            "%d file(s) will be written straight into %s, overwriting whatever "
+        names = "\n".join("    %s   <-  %s" % (r["remote"], r["sub"]) for r in bare)
+        return self.ask_yes_no("%d file(s) will be written straight into %s, overwriting whatever "
             "is there:\n\n%s\n\nIs that what you want?" % (len(bare), where, names),
             icon="warning", default="no")
 
@@ -1003,19 +1234,18 @@ class App(tk.Tk):
             return
         todo = [r for r in self.rows if r["status"] == "OK"]
         if not todo:
-            messagebox.showinfo(APP_NAME, "Nothing resolved to upload. Press Resolve first.")
+            self.say_info("Nothing resolved to upload. Press Resolve first.")
             return
         s = self.collect()
         if not s["host"] or not s["user"]:
-            messagebox.showerror(APP_NAME, "Host and user are required.")
+            self.sec_server.open()
+            self.say_error("Host and user are required.")
             return
 
         preview = "\n".join("    " + r["remote"] for r in todo[:12])
         if len(todo) > 12:
             preview += "\n    ... and %d more" % (len(todo) - 12)
-        if not messagebox.askyesno(
-                APP_NAME,
-                "Project '%s'\n\nUpload %d file(s) to %s\n\n%s"
+        if not self.ask_yes_no("Project '%s'\n\nUpload %d file(s) to %s\n\n%s"
                 % (self.project, len(todo), self.target_label(), preview)):
             return
         if not self.root_level_warning(todo):

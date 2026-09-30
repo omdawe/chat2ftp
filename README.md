@@ -45,29 +45,47 @@ Windows-first, but it's plain Python + Tkinter so it runs on macOS and Linux too
 The file list shows exactly where every file will land, and the confirmation dialog
 lists the remote paths, before anything is sent.
 
+**Layout.** Project, Build, Files and Log sit at the top — the panels you work in.
+Folders and Server fold away below them, since they are set once per project and rarely
+touched. If something is wrong in a folded section the app opens it for you, and the
+active local base stays visible in the Build bar even while Server is closed.
+
+The whole window scrolls, so nothing is out of reach in a small window. The scrollbar
+appears only when the content doesn't fit, the mouse wheel scrolls the page except over
+the Files list, the Log and the paste box, which keep their own scrolling, and opening a
+folded section scrolls it into view. The status bar stays put at the bottom. Log lines
+are timestamped, and dialogs open centred over the window rather than the middle of the
+screen.
+
 ### How the remote path is decided
 
-**The remote path always mirrors where the file actually sits locally.** It is never
-taken from the pasted text alone. Two rules enforce that:
+**The zip decides where a file goes. The pasted line only decides which files go.**
 
-- A listed path only matches a file whose local path *ends with the whole listed path*,
-  so the remote path is always a real tail of the local one. There is no
-  match-by-filename fallback — a bare `index.php` will not be matched against some
-  `app/modules/index.php` and then uploaded to your web root.
-- If a listed path is a bare filename but the file lives in a subfolder locally, it is
-  refused with `NEEDS BASE` rather than guessed at.
-
-**Local base** (optional, per project) is the folder inside the zip that corresponds to
-your remote root. Set it and the mapping becomes exact and obvious:
+Every upload path is the file's own path inside the zip, below the **local base** — the
+folder in the zip that corresponds to your remote root. The base is auto-detected on
+load (packaging folders that hold a single subfolder and nothing else are skipped
+through) and shown in the field so you can see and change it.
 
 | | |
 |---|---|
-| local base | `build/public` |
-| file in zip | `build/public/css/app.css` |
-| uploads to | `<remote root>/css/app.css` |
+| local base | `build/site` (auto-detected) |
+| file in zip | `build/site/public/index.php` |
+| uploads to | `<remote root>/public/index.php` |
 
-Files outside that base are flagged `OUTSIDE BASE` and skipped — handy when a zip
-carries both server files and things that must never reach the server.
+So a chat line that says just `index.php` cannot send that file to your web root. The
+text is never used as a destination — only to pick files out of the zip.
+
+Listed names may be:
+
+- a full path below the base — `public/inc/money.php`
+- a path tail — `inc/money.php`, or a bare `faq.php`
+- a glob — `public/*.php` selects the php files directly in that folder. `*` stops at a
+  folder boundary like it does in a shell, so it won't reach into `inc/` or
+  `admin/public/`. Use `**` when you do want to cross folders.
+
+If a plain name matches more than one file — a zip with both `public/index.php` and
+`public/microsite/index.php` — it is refused as `AMBIGUOUS` and both candidates
+are listed, so you can name the one you meant. It never picks for you.
 
 ### Safety nets
 
