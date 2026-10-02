@@ -45,12 +45,30 @@ import traceback
 import subprocess
 import configparser
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Chat2FTP"
 APP_TAGLINE = "paste a chat message, upload the files it names"
-APP_VERSION = "1.7"
+APP_VERSION = "2.0"
 INI_NAME = "chat2ftp.ini"
+
+# A green accent for the two buttons that actually do something, and for the
+# "Done." line in the log. tk.Button is used rather than ttk.Button because the
+# native Windows ttk theme draws buttons from images and ignores a background.
+GREEN = "#1e7e34"
+GREEN_HOVER = "#19692c"
+LOG_OK_BG = "#d7f3dd"
+LOG_FAIL_BG = "#f8d7da"
+
+
+def accent_button(parent, text, command):
+    return tk.Button(parent, text=text, command=command,
+                     bg=GREEN, fg="white",
+                     activebackground=GREEN_HOVER, activeforeground="white",
+                     disabledforeground="#bcd9c4",
+                     relief="raised", bd=1, highlightthickness=0,
+                     padx=12, pady=3, cursor="hand2")
+
 
 GENERAL = "general"
 PROJECT_PREFIX = "project:"
@@ -65,6 +83,7 @@ FIELDS = {
     "zip_dir":        os.path.join(os.path.expanduser("~"), "Downloads"),
     "work_dir":       os.path.join(os.path.expanduser("~"), "chat2ftp", "work"),
     "pattern":        "*.zip",
+    "patterns":       "*.zip",
     "protocol":       "FTP",
     "host":           "",
     "port":           "21",
@@ -81,6 +100,23 @@ FIELDS = {
 # keys used by older builds -> current keys
 RENAMED = {"downloads_dir": "zip_dir"}
 OLD_SECTIONS = ("paths", "build", "server")
+
+# several build patterns per project, kept on one ini line
+PATTERN_SEP = "|"
+
+
+def split_patterns(raw):
+    out, seen = [], set()
+    for item in (raw or "").split(PATTERN_SEP):
+        item = item.strip()
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
+            out.append(item)
+    return out
+
+
+def join_patterns(items):
+    return PATTERN_SEP.join(items)
 
 
 # ---------------------------------------------------------------- ini location
@@ -202,6 +238,8 @@ class Store:
             for old, new in RENAMED.items():
                 if self.cp.has_option(sec, old) and not self.cp.has_option(sec, new):
                     values[new] = self.cp.get(sec, old)
+        if not split_patterns(values.get("patterns")):
+            values["patterns"] = values.get("pattern") or FIELDS["pattern"]
         return values
 
     def put(self, name, values):
@@ -715,10 +753,16 @@ class App(tk.Tk):
         bar = ttk.Frame(box)
         bar.pack(fill="x", padx=6, pady=4)
         ttk.Label(bar, text="File pattern").pack(side="left")
-        self.var["pattern"] = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.var["pattern"], width=30).pack(side="left", padx=(6, 12))
-        ttk.Button(bar, text="Load Build", command=self.on_load_build).pack(side="left")
-        ttk.Button(bar, text="Pick Zip...", command=self.on_pick_zip).pack(side="left", padx=(6, 0))
+        self.var["pattern"] = tk.StringVar()     # the one in use
+        self.var["patterns"] = tk.StringVar()    # all of them, saved per project
+        self.pattern_cb = ttk.Combobox(bar, textvariable=self.var["pattern"], width=28)
+        self.pattern_cb.pack(side="left", padx=(6, 4))
+        ttk.Button(bar, text="+", width=3, command=self.on_pattern_add).pack(side="left")
+        ttk.Button(bar, text="\u2212", width=3, command=self.on_pattern_remove).pack(
+            side="left", padx=(2, 12))
+        ttk.Button(bar, text="Pick Zip...", command=self.on_pick_zip).pack(side="left")
+        self.btn_load = accent_button(bar, "Load Build", self.on_load_build)
+        self.btn_load.pack(side="left", padx=(6, 0))
         self.zip_label = ttk.Label(bar, text="no build loaded")
         self.zip_label.pack(side="left", padx=12)
         # the base decides every upload path, so it stays visible even while
@@ -733,20 +777,20 @@ class App(tk.Tk):
         bar = ttk.Frame(box)
         bar.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(bar, text="Resolve", command=self.on_resolve).pack(side="left")
-        self.btn_upload = ttk.Button(bar, text="Upload", command=self.on_upload)
+        self.btn_upload = accent_button(bar, "Upload", self.on_upload)
         self.btn_upload.pack(side="left", padx=(6, 0))
 
         # --- file list
         box = ttk.LabelFrame(self.page, text="Files")
         box.pack(fill="both", expand=True, padx=8, pady=4)
-        cols = ("status", "remote", "local")
+        cols = ("status", "local", "remote")
         self.tree = ttk.Treeview(box, columns=cols, show="headings", height=8)
         self.tree.heading("status", text="Status")
-        self.tree.heading("remote", text="Uploads to")
         self.tree.heading("local", text="From (inside work folder)")
+        self.tree.heading("remote", text="Uploads to")
         self.tree.column("status", width=110, anchor="w")
-        self.tree.column("remote", width=330, anchor="w")
-        self.tree.column("local", width=450, anchor="w")
+        self.tree.column("local", width=430, anchor="w")
+        self.tree.column("remote", width=350, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
         sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
@@ -760,6 +804,9 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(box, orient="vertical", command=self.logbox.yview)
         sb.pack(side="right", fill="y", pady=6, padx=(0, 6))
         self.logbox.configure(yscrollcommand=sb.set)
+        # tagging the trailing newline too makes the colour span the full width
+        self.logbox.tag_configure("ok", background=LOG_OK_BG)
+        self.logbox.tag_configure("fail", background=LOG_FAIL_BG)
 
         # --- folders (collapsed section, below the panels that matter)
         self.sec_folders = Collapsible(self.page, "Folders", opened=False,
@@ -876,6 +923,50 @@ class App(tk.Tk):
             v.set(values.get(k, FIELDS[k]))
         self.text.delete("1.0", "end")
         self._loading = was
+        self.refresh_patterns()
+
+    def refresh_patterns(self):
+        items = split_patterns(self.var["patterns"].get())
+        cur = self.var["pattern"].get().strip()
+        if cur and cur.lower() not in [i.lower() for i in items]:
+            items = items + [cur]          # shown, not saved until you add it
+        self.pattern_cb.configure(values=items)
+
+    def remember_pattern(self, pattern):
+        """Keep a pattern in this project's list. Used by + and by a load that
+           worked, so patterns you actually use end up in the dropdown."""
+        pattern = (pattern or "").strip()
+        if not pattern:
+            return False
+        items = split_patterns(self.var["patterns"].get())
+        if pattern.lower() in [i.lower() for i in items]:
+            return False
+        items.append(pattern)
+        self.var["patterns"].set(join_patterns(items))
+        self.refresh_patterns()
+        return True
+
+    def on_pattern_add(self):
+        pattern = self.var["pattern"].get().strip()
+        if not pattern:
+            self.say_info("Type a pattern first, e.g. myproject-v*.zip")
+            return
+        if self.remember_pattern(pattern):
+            self.log("Added build pattern '%s' to project '%s'." % (pattern, self.project))
+        else:
+            self.log("Pattern '%s' is already in this project." % pattern)
+
+    def on_pattern_remove(self):
+        pattern = self.var["pattern"].get().strip()
+        items = split_patterns(self.var["patterns"].get())
+        keep = [i for i in items if i.lower() != pattern.lower()]
+        if len(keep) == len(items):
+            self.log("Pattern '%s' is not in this project's list." % pattern)
+            return
+        self.var["patterns"].set(join_patterns(keep))
+        self.var["pattern"].set(keep[0] if keep else "")
+        self.refresh_patterns()
+        self.log("Removed build pattern '%s'." % pattern)
 
     def refresh_projects(self):
         names = self.store.projects()
@@ -926,7 +1017,7 @@ class App(tk.Tk):
     # -------------------------------------------------------- projects
 
     def _ask_name(self, title, initial=""):
-        name = simpledialog.askstring(title, "Project name:", initialvalue=initial, parent=self)
+        name = self.ask_text("%s\n\nProject name:" % title, initial)
         if name is None:
             return None
         name = name.strip()
@@ -1005,27 +1096,142 @@ class App(tk.Tk):
 
     # -------------------------------------------------------- helpers
 
-    def log(self, msg):
+    def log(self, msg, tag=None):
         stamp = time.strftime("%H:%M:%S")
+        tags = (tag,) if tag else ()
         def _do():
             self.logbox.configure(state="normal")
             for i, line in enumerate((msg or "").split("\n")):
                 # continuation lines line up under the first, not restamped
-                self.logbox.insert("end", ("%s  " % stamp if i == 0 else " " * 10) + line + "\n")
+                self.logbox.insert("end",
+                                   ("%s  " % stamp if i == 0 else " " * 10) + line + "\n",
+                                   tags)
             self.logbox.see("end")
             self.logbox.configure(state="disabled")
         self.after(0, _do)
 
     # Every dialog is given this window as its parent, so it opens centred over
     # the app instead of the middle of the screen.
-    def say_error(self, msg):
-        messagebox.showerror(APP_NAME, msg, parent=self)
+    def _modal(self, message, detail=None, kind="info",
+               buttons=("OK",), default=0, entry=None):
+        """The one dialog this app uses - for telling you something, asking a
+           yes/no, or taking a short bit of text.
 
-    def say_info(self, msg):
-        messagebox.showinfo(APP_NAME, msg, parent=self)
+           It is a Toplevel of our own rather than tkinter.messagebox, because
+           the Windows native message box ignores its parent when deciding
+           where to sit and lands in the middle of the screen. buttons[0] is
+           the affirmative, buttons[-1] is cancel. Returns the pressed label,
+           or the typed text when entry is given (None if cancelled)."""
+        win = tk.Toplevel(self)
+        win.title(APP_NAME)
+        win.transient(self)
+        win.resizable(False, False)
+        out = {"value": buttons[-1] if entry is None else None}
+        var = tk.StringVar(value=entry or "")
 
-    def ask_yes_no(self, msg, **kw):
-        return messagebox.askyesno(APP_NAME, msg, parent=self, **kw)
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=16, pady=(14, 10))
+        sign, colour = {
+            "info":     ("\u2139", "#1a5fb4"),
+            "error":    ("\u2715", "#c01c28"),
+            "warn":     ("\u26a0", "#c64600"),
+            "question": ("?",      "#1a5fb4"),
+        }.get(kind, ("\u2139", "#1a5fb4"))
+        tk.Label(body, text=sign, fg=colour,
+                 font=("Segoe UI", 16, "bold")).pack(side="left", anchor="n", padx=(0, 12))
+
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True)
+        ttk.Label(right, text=message, wraplength=440, justify="left").pack(anchor="w")
+
+        if entry is not None:
+            ent = ttk.Entry(right, textvariable=var, width=46)
+            ent.pack(fill="x", pady=(10, 0))
+            ent.selection_range(0, "end")
+            ent.focus_set()
+
+        if detail:
+            lines = detail.split("\n")
+            wrap = ttk.Frame(right)
+            wrap.pack(fill="both", expand=True, pady=(10, 0))
+            txt = tk.Text(wrap, height=min(12, max(2, len(lines))), width=56,
+                          wrap="none", relief="flat", background="#f4f4f4",
+                          borderwidth=0, highlightthickness=0)
+            txt.insert("1.0", detail)
+            txt.configure(state="disabled")
+            txt.pack(side="left", fill="both", expand=True)
+            if len(lines) > 12:
+                sb = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+                sb.pack(side="right", fill="y")
+                txt.configure(yscrollcommand=sb.set)
+
+        def finish(label):
+            if entry is not None:
+                out["value"] = var.get() if label == buttons[0] else None
+            else:
+                out["value"] = label
+            win.destroy()
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=16, pady=(0, 14))
+        for i in range(len(buttons) - 1, -1, -1):          # rightmost packed first
+            label = buttons[i]
+            # green marks the default only when the default is the affirmative;
+            # on a warning the default is "No" and green would read as "go"
+            if i == default == 0:
+                b = accent_button(row, label, lambda l=label: finish(l))
+            else:
+                b = ttk.Button(row, text=label, command=lambda l=label: finish(l))
+            b.pack(side="right", padx=(6, 0))
+            if i == default and entry is None:
+                b.focus_set()
+
+        win.bind("<Return>", lambda _e: finish(buttons[default if entry is None else 0]))
+        win.bind("<Escape>", lambda _e: finish(buttons[-1]))
+        win.protocol("WM_DELETE_WINDOW", lambda: finish(buttons[-1]))
+        self.place_over_window(win)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        win.wait_window()
+        return out["value"]
+
+    def place_over_window(self, win):
+        """Centre a dialog on the app window, a little above the middle, and
+           keep it on screen if the app is near an edge."""
+        try:
+            win.update_idletasks()
+            self.update_idletasks()
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+            px, py = self.winfo_rootx(), self.winfo_rooty()
+            pw, ph = self.winfo_width(), self.winfo_height()
+            if pw <= 1 or ph <= 1:                 # window not mapped yet
+                px, py = 0, 0
+                pw, ph = self.winfo_screenwidth(), self.winfo_screenheight()
+            x = px + max(0, (pw - w) // 2)
+            y = py + max(0, (ph - h) // 3)
+            x = max(0, min(x, self.winfo_screenwidth() - w))
+            y = max(0, min(y, self.winfo_screenheight() - h))
+            win.geometry("+%d+%d" % (x, y))
+        except Exception:
+            pass
+
+    def say_error(self, msg, detail=None):
+        self._modal(msg, detail, kind="error", buttons=("OK",))
+
+    def say_info(self, msg, detail=None):
+        self._modal(msg, detail, kind="info", buttons=("OK",))
+
+    def ask_yes_no(self, msg, detail=None, danger=False):
+        answer = self._modal(msg, detail,
+                             kind="warn" if danger else "question",
+                             buttons=("Yes", "No"), default=1 if danger else 0)
+        return answer == "Yes"
+
+    def ask_text(self, msg, initial=""):
+        return self._modal(msg, kind="question", buttons=("OK", "Cancel"),
+                           entry=initial)
 
     def blocked_set(self):
         raw = self.var["blocklist"].get()
@@ -1085,11 +1291,13 @@ class App(tk.Tk):
             self.sec_folders.open()
             self.say_error("Zip folder not found:\n%s" % folder)
             return
-        pattern = self.var["pattern"].get()
+        pattern = self.var["pattern"].get().strip()
         z = find_build(folder, pattern)
         if not z:
             self.say_error("Nothing matching '%s' in:\n%s" % (pattern, folder))
             return
+        if self.remember_pattern(pattern):
+            self.log("Remembered build pattern '%s'." % pattern)
         self._load_zip(z)
 
     def on_pick_zip(self):
@@ -1194,8 +1402,10 @@ class App(tk.Tk):
 
         self.tree.delete(*self.tree.get_children())
         for r in self.rows:
-            self.tree.insert("", "end", values=(r["status"], r["remote"],
-                                                (base + "/" + r["sub"]) if r["sub"] else r["token"]))
+            self.tree.insert("", "end",
+                             values=(r["status"],
+                                     (base + "/" + r["sub"]) if r["sub"] else r["token"],
+                                     r["remote"]))
 
         ok = sum(1 for r in self.rows if r["status"] == "OK")
         self.log("Base '%s'. Resolved %d file(s) from %d listed item(s). Target %s"
@@ -1224,10 +1434,11 @@ class App(tk.Tk):
         if not bare:
             return True
         where = ("/" + root) if root else "the login folder (your web root)"
-        names = "\n".join("    %s   <-  %s" % (r["remote"], r["sub"]) for r in bare)
-        return self.ask_yes_no("%d file(s) will be written straight into %s, overwriting whatever "
-            "is there:\n\n%s\n\nIs that what you want?" % (len(bare), where, names),
-            icon="warning", default="no")
+        names = "\n".join("%s   <-  %s" % (r["remote"], r["sub"]) for r in bare)
+        return self.ask_yes_no(
+            "%d file(s) will be written straight into %s, overwriting whatever is "
+            "there. Is that what you want?" % (len(bare), where),
+            detail=names, danger=True)
 
     def on_upload(self):
         if self.busy:
@@ -1242,11 +1453,11 @@ class App(tk.Tk):
             self.say_error("Host and user are required.")
             return
 
-        preview = "\n".join("    " + r["remote"] for r in todo[:12])
-        if len(todo) > 12:
-            preview += "\n    ... and %d more" % (len(todo) - 12)
-        if not self.ask_yes_no("Project '%s'\n\nUpload %d file(s) to %s\n\n%s"
-                % (self.project, len(todo), self.target_label(), preview)):
+        listing = "\n".join(r["remote"] for r in todo)
+        if not self.ask_yes_no(
+                "Project '%s'\n\nUpload %d file(s) to %s ?"
+                % (self.project, len(todo), self.target_label()),
+                detail=listing):
             return
         if not self.root_level_warning(todo):
             return
@@ -1283,7 +1494,8 @@ class App(tk.Tk):
                     failed += 1
                     self.log("FAIL %s  (%s)" % (r["remote"], e))
             self.log("Done. %d uploaded, %d failed, %d previous version(s) backed up."
-                     % (sent, failed, saved))
+                     % (sent, failed, saved),
+                     tag="fail" if failed else "ok")
             if saved:
                 self.log("Backups: %s" % backup_dir)
         except Exception as e:

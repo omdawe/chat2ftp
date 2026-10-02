@@ -20,7 +20,8 @@ Windows-first, but it's plain Python + Tkinter so it runs on macOS and Linux too
 ## How it works
 
 1. **Zip folder** — where your downloaded build zips land, usually `Downloads`.
-2. **Load Build** — picks the highest-numbered zip matching your pattern
+2. **Load Build** (the green button) — picks the highest-numbered zip matching the
+   selected pattern
    (`mysite-v*.zip` takes `v12` over `v11`, and `v100` over both) and unzips it into
    the **work folder**, keeping the zip's own structure. No extra subfolder is
    invented:
@@ -42,7 +43,8 @@ Windows-first, but it's plain Python + Tkinter so it runs on macOS and Linux too
 5. **Upload** — each file goes to `remote root` + its path, creating remote folders as
    needed. Leave **remote root** empty to upload straight into the login directory.
 
-The file list shows exactly where every file will land, and the confirmation dialog
+The file list reads left to right the way the transfer runs — where the file came from,
+then where it goes. It shows exactly where every file will land, and the confirmation dialog
 lists the remote paths, before anything is sent.
 
 **Layout.** Project, Build, Files and Log sit at the top — the panels you work in.
@@ -53,9 +55,9 @@ active local base stays visible in the Build bar even while Server is closed.
 The whole window scrolls, so nothing is out of reach in a small window. The scrollbar
 appears only when the content doesn't fit, the mouse wheel scrolls the page except over
 the Files list, the Log and the paste box, which keep their own scrolling, and opening a
-folded section scrolls it into view. The status bar stays put at the bottom. Log lines
-are timestamped, and dialogs open centred over the window rather than the middle of the
-screen.
+folded section scrolls it into view. The status bar stays put at the bottom. Log lines are timestamped, and every prompt is one dialog of the app's own, placed over
+the window rather than the middle of the screen — Windows' native message box ignores
+its parent when deciding where to sit, so the standard one could not be used.
 
 ### How the remote path is decided
 
@@ -94,6 +96,9 @@ are listed, so you can name the one you meant. It never picks for you.
   `ROOT BLOCKED` unless the project explicitly ticks *Allow writes to the remote root*.
   With it ticked you still get a warning listing each file and where it came from,
   defaulting to "no".
+- **The finishing line is colour-coded.** `Done. 4 uploaded, 0 failed…` gets a green
+  background; if anything failed it goes red, so you never have to read the count to
+  know how it went.
 - **Backup before overwrite** (on by default). Each remote file is downloaded before it
   is replaced, into `<work folder>\_chat2ftp_backup\<timestamp>\`, mirroring the remote
   paths. If a build goes wrong, the previous version is sitting on your disk.
@@ -126,13 +131,20 @@ defaults do the simple thing.
 
 ## Projects
 
-Each project keeps its own zip folder, work folder, filename pattern, server login,
+Each project keeps its own zip folder, work folder, build patterns, server login,
 remote root and never-upload list. Switch with the dropdown at the top; **New**,
 **Duplicate**, **Rename** and **Delete** sit next to it. Switching projects clears the
 loaded build, so you can't accidentally push one site's files to another.
 
 Useful when you maintain several sites, or ship a web app and a desktop build out of the
 same conversation.
+
+**Several build patterns per project.** The file pattern is a dropdown. Type one and
+press **+** to keep it; **−** drops the selected one. A pattern that successfully loads a
+build is remembered automatically. So a project that ships two zip families —
+`myproject-web-v*.zip` and `myproject-app-v*.zip` — switches between them from the
+dropdown instead of needing two projects. They are stored on one ini line, separated by
+`|`.
 
 ---
 
